@@ -401,6 +401,7 @@ int pa_source_output_new(
                         ((data->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) ? PA_RESAMPLER_VARIABLE_RATE : 0) |
                         ((data->flags & PA_SOURCE_OUTPUT_NO_REMAP) ? PA_RESAMPLER_NO_REMAP : 0) |
                         (core->disable_remixing || (data->flags & PA_SOURCE_OUTPUT_NO_REMIX) ? PA_RESAMPLER_NO_REMIX : 0) |
+                        (core->remixing_use_all_sink_channels ? 0 : PA_RESAMPLER_NO_FILL_SINK) |
                         (core->disable_lfe_remixing ? PA_RESAMPLER_NO_LFE : 0)))) {
                 pa_log_warn("Unsupported resampling operation.");
                 return -PA_ERR_NOTSUPPORTED;
@@ -523,14 +524,18 @@ static void source_output_set_state(pa_source_output *o, pa_source_output_state_
     if (o->state == state)
         return;
 
-    if (o->state == PA_SOURCE_OUTPUT_CORKED && state == PA_SOURCE_OUTPUT_RUNNING && pa_source_used_by(o->source) == 0 &&
-        !pa_sample_spec_equal(&o->sample_spec, &o->source->sample_spec)) {
-        /* We were uncorked and the source was not playing anything -- let's try
-         * to update the sample rate to avoid resampling */
-        pa_source_update_rate(o->source, o->sample_spec.rate, pa_source_output_is_passthrough(o));
-    }
+    if (o->source) {
+        if (o->state == PA_SOURCE_OUTPUT_CORKED && state == PA_SOURCE_OUTPUT_RUNNING && pa_source_used_by(o->source) == 0 &&
+            !pa_sample_spec_equal(&o->sample_spec, &o->source->sample_spec)) {
+            /* We were uncorked and the source was not playing anything -- let's try
+             * to update the sample rate to avoid resampling */
+            pa_source_update_rate(o->source, o->sample_spec.rate, pa_source_output_is_passthrough(o));
+        }
 
-    pa_assert_se(pa_asyncmsgq_send(o->source->asyncmsgq, PA_MSGOBJECT(o), PA_SOURCE_OUTPUT_MESSAGE_SET_STATE, PA_UINT_TO_PTR(state), 0, NULL) == 0);
+        pa_assert_se(pa_asyncmsgq_send(o->source->asyncmsgq, PA_MSGOBJECT(o), PA_SOURCE_OUTPUT_MESSAGE_SET_STATE, PA_UINT_TO_PTR(state), 0, NULL) == 0);
+    } else
+        /* If the source is not valid, pa_source_output_set_state_within_thread() must be called directly */
+        pa_source_output_set_state_within_thread(o, state);
 
     update_n_corked(o, state);
     o->state = state;
@@ -542,13 +547,15 @@ static void source_output_set_state(pa_source_output *o, pa_source_output_state_
             pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
     }
 
-    pa_source_update_status(o->source);
+    if (o->source)
+        pa_source_update_status(o->source);
 }
 
 /* Called from main context */
 void pa_source_output_unlink(pa_source_output*o) {
     bool linked;
-    pa_assert(o);
+
+    pa_source_output_assert_ref(o);
     pa_assert_ctl_context();
 
     /* See pa_sink_unlink() for a couple of comments how this function
@@ -590,16 +597,16 @@ void pa_source_output_unlink(pa_source_output*o) {
 
     reset_callbacks(o);
 
-    if (linked) {
-        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_REMOVE, o->index);
-        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_UNLINK_POST], o);
-    }
-
     if (o->source) {
         if (PA_SOURCE_IS_LINKED(pa_source_get_state(o->source)))
             pa_source_update_status(o->source);
 
         o->source = NULL;
+    }
+
+    if (linked) {
+        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_REMOVE, o->index);
+        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_UNLINK_POST], o);
     }
 
     pa_core_maybe_vacuum(o->core);
@@ -614,9 +621,7 @@ static void source_output_free(pa_object* mo) {
     pa_assert(o);
     pa_assert_ctl_context();
     pa_assert(pa_source_output_refcnt(o) == 0);
-
-    if (PA_SOURCE_OUTPUT_IS_LINKED(o->state))
-        pa_source_output_unlink(o);
+    pa_assert(!PA_SOURCE_OUTPUT_IS_LINKED(o->state));
 
     pa_log_info("Freeing output %u \"%s\"", o->index,
                 o->proplist ? pa_strnull(pa_proplist_gets(o->proplist, PA_PROP_MEDIA_NAME)) : "");
@@ -748,7 +753,7 @@ void pa_source_output_push(pa_source_output *o, const pa_memchunk *chunk) {
          * of the queued data is actually still changeable. Hence
          * FIXME! */
 
-        latency = pa_sink_get_latency_within_thread(o->source->monitor_of);
+        latency = pa_sink_get_latency_within_thread(o->source->monitor_of, false);
 
         n = pa_usec_to_bytes(latency, &o->source->sample_spec);
 
@@ -1087,10 +1092,10 @@ void pa_source_output_set_property(pa_source_output *o, const char *key, const c
 
     if (pa_proplist_contains(o->proplist, key)) {
         old_value = pa_xstrdup(pa_proplist_gets(o->proplist, key));
-        if (old_value) {
-            if (pa_streq(value, old_value))
-                goto finish;
-        } else
+        if (value && old_value && pa_streq(value, old_value))
+            goto finish;
+
+        if (!old_value)
             old_value = pa_xstrdup("(data)");
     } else {
         if (!value)
@@ -1107,7 +1112,7 @@ void pa_source_output_set_property(pa_source_output *o, const char *key, const c
         new_value = "(unset)";
     }
 
-    if (PA_SINK_INPUT_IS_LINKED(o->state)) {
+    if (PA_SOURCE_OUTPUT_IS_LINKED(o->state)) {
         pa_log_debug("Source output %u: proplist[%s]: %s -> %s", o->index, key, old_value, new_value);
         pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PROPLIST_CHANGED], o);
         pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT | PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
@@ -1260,6 +1265,22 @@ static bool find_filter_source_output(pa_source_output *target, pa_source *s) {
     return false;
 }
 
+static bool is_filter_source_moving(pa_source_output *o) {
+    pa_source *source = o->source;
+
+    if (!source)
+        return false;
+
+    while (source->output_from_master) {
+        source = source->output_from_master->source;
+
+        if (!source)
+            return true;
+    }
+
+    return false;
+}
+
 /* Called from main context */
 bool pa_source_output_may_move_to(pa_source_output *o, pa_source *dest) {
     pa_source_output_assert_ref(o);
@@ -1278,6 +1299,17 @@ bool pa_source_output_may_move_to(pa_source_output *o, pa_source *dest) {
     /* Make sure we're not creating a filter source cycle */
     if (find_filter_source_output(o, dest)) {
         pa_log_debug("Can't connect output to %s, as that would create a cycle.", dest->name);
+        return false;
+    }
+
+    /* If this source output is connected to a filter source that itself is
+     * moving, then don't allow the move. Moving requires sending a message to
+     * the IO thread of the old source, and if the old source is a filter
+     * source that is moving, there's no IO thread associated to the old
+     * source. */
+    if (is_filter_source_moving(o)) {
+        pa_log_debug("Can't move output from filter source %s, because the filter source itself is currently moving.",
+                     o->source->name);
         return false;
     }
 
@@ -1584,10 +1616,9 @@ int pa_source_output_move_to(pa_source_output *o, pa_source *dest, bool save) {
     return 0;
 }
 
-/* Called from IO thread context */
+/* Called from IO thread context except when cork() is called without a valid source. */
 void pa_source_output_set_state_within_thread(pa_source_output *o, pa_source_output_state_t state) {
     pa_source_output_assert_ref(o);
-    pa_source_output_assert_io_context(o);
 
     if (state == o->thread_info.state)
         return;
@@ -1609,7 +1640,7 @@ int pa_source_output_process_msg(pa_msgobject *mo, int code, void *userdata, int
             pa_usec_t *r = userdata;
 
             r[0] += pa_bytes_to_usec(pa_memblockq_get_length(o->thread_info.delay_memblockq), &o->source->sample_spec);
-            r[1] += pa_source_get_latency_within_thread(o->source);
+            r[1] += pa_source_get_latency_within_thread(o->source, false);
 
             return 0;
         }
@@ -1715,6 +1746,7 @@ int pa_source_output_update_rate(pa_source_output *o) {
                                      ((o->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) ? PA_RESAMPLER_VARIABLE_RATE : 0) |
                                      ((o->flags & PA_SOURCE_OUTPUT_NO_REMAP) ? PA_RESAMPLER_NO_REMAP : 0) |
                                      (o->core->disable_remixing || (o->flags & PA_SOURCE_OUTPUT_NO_REMIX) ? PA_RESAMPLER_NO_REMIX : 0) |
+                                     (o->core->remixing_use_all_sink_channels ? 0 : PA_RESAMPLER_NO_FILL_SINK) |
                                      (o->core->disable_lfe_remixing ? PA_RESAMPLER_NO_LFE : 0));
 
         if (!new_resampler) {
@@ -1752,6 +1784,30 @@ int pa_source_output_update_rate(pa_source_output *o) {
     pa_log_debug("Updated resampler for source output %d", o->index);
 
     return 0;
+}
+
+/* Called from the IO thread. */
+void pa_source_output_attach(pa_source_output *o) {
+    pa_assert(o);
+    pa_assert(!o->thread_info.attached);
+
+    o->thread_info.attached = true;
+
+    if (o->attach)
+        o->attach(o);
+}
+
+/* Called from the IO thread. */
+void pa_source_output_detach(pa_source_output *o) {
+    pa_assert(o);
+
+    if (!o->thread_info.attached)
+        return;
+
+    o->thread_info.attached = false;
+
+    if (o->detach)
+        o->detach(o);
 }
 
 /* Called from the main thread. */

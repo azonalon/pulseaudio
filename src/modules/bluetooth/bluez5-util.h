@@ -95,6 +95,7 @@ struct pa_bluetooth_device {
     bool properties_received;
     bool tried_to_link_with_adapter;
     bool valid;
+    bool autodetect_mtu;
 
     /* Device information */
     char *path;
@@ -102,9 +103,11 @@ struct pa_bluetooth_device {
     char *alias;
     char *address;
     uint32_t class_of_device;
-    pa_hashmap *uuids;
+    pa_hashmap *uuids; /* char* -> char* (hashmap-as-a-set) */
 
     pa_bluetooth_transport *transports[PA_BLUETOOTH_PROFILE_COUNT];
+
+    pa_time_event *wait_for_profiles_timer;
 };
 
 struct pa_bluetooth_adapter {
@@ -126,13 +129,15 @@ static inline void pa_bluetooth_ofono_backend_free(pa_bluetooth_backend *b) {}
 #endif
 
 #ifdef HAVE_BLUEZ_5_NATIVE_HEADSET
-pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_discovery *y);
+pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_discovery *y, bool enable_hs_role);
 void pa_bluetooth_native_backend_free(pa_bluetooth_backend *b);
+void pa_bluetooth_native_backend_enable_hs_role(pa_bluetooth_backend *b, bool enable_hs_role);
 #else
-static inline pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_discovery *y) {
+static inline pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_discovery *y, bool enable_hs_role) {
     return NULL;
 }
 static inline void pa_bluetooth_native_backend_free(pa_bluetooth_backend *b) {}
+static inline void pa_bluetooth_native_backend_enable_hs_role(pa_bluetooth_backend *b, bool enable_hs_role) {}
 #endif
 
 pa_bluetooth_transport *pa_bluetooth_transport_new(pa_bluetooth_device *d, const char *owner, const char *path,

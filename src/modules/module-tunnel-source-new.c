@@ -402,29 +402,29 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
             pa_usec_t remote_latency;
 
             if (!PA_SOURCE_IS_LINKED(u->source->thread_info.state)) {
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
                 return 0;
             }
 
             if (!u->stream) {
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
                 return 0;
             }
 
             if (pa_stream_get_state(u->stream) != PA_STREAM_READY) {
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
                 return 0;
             }
 
             if (pa_stream_get_latency(u->stream, &remote_latency, &negative) < 0) {
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
                 return 0;
             }
 
             if (negative)
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = - (int64_t)remote_latency;
             else
-                *((pa_usec_t*) data) = remote_latency;
+                *((int64_t*) data) = remote_latency;
 
             return 0;
         }
@@ -496,7 +496,11 @@ int pa__init(pa_module *m) {
     u->remote_source_name = pa_xstrdup(pa_modargs_get_value(ma, "source", NULL));
 
     u->thread_mq = pa_xnew0(pa_thread_mq, 1);
-    pa_thread_mq_init_thread_mainloop(u->thread_mq, m->core->mainloop, u->thread_mainloop_api);
+
+    if (pa_thread_mq_init_thread_mainloop(u->thread_mq, m->core->mainloop, u->thread_mainloop_api) < 0) {
+        pa_log("pa_thread_mq_init_thread_mainloop() failed.");
+        goto fail;
+    }
 
     /* Create source */
     pa_source_new_data_init(&source_data);

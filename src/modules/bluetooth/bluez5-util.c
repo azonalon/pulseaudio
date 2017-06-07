@@ -21,6 +21,8 @@
 #include <config.h>
 #endif
 
+#include <pulse/rtclock.h>
+#include <pulse/timeval.h>
 #include <pulse/xmalloc.h>
 
 #include <pulsecore/core.h>
@@ -34,6 +36,8 @@
 #include "a2dp-codecs.h"
 
 #include "bluez5-util.h"
+
+#define WAIT_FOR_PROFILES_TIMEOUT_USEC (3 * PA_USEC_PER_SEC)
 
 #define BLUEZ_SERVICE "org.bluez"
 #define BLUEZ_ADAPTER_INTERFACE BLUEZ_SERVICE ".Adapter1"
@@ -164,8 +168,100 @@ static const char *transport_state_to_string(pa_bluetooth_transport_state_t stat
     return "invalid";
 }
 
+static bool device_supports_profile(pa_bluetooth_device *device, pa_bluetooth_profile_t profile) {
+    switch (profile) {
+        case PA_BLUETOOTH_PROFILE_A2DP_SINK:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_A2DP_SINK);
+        case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_A2DP_SOURCE);
+        case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HSP_HS)
+                || !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HFP_HF);
+        case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HSP_AG)
+                || !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HFP_AG);
+        case PA_BLUETOOTH_PROFILE_OFF:
+            pa_assert_not_reached();
+    }
+
+    pa_assert_not_reached();
+}
+
+static bool device_is_profile_connected(pa_bluetooth_device *device, pa_bluetooth_profile_t profile) {
+    if (device->transports[profile] && device->transports[profile]->state != PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED)
+        return true;
+    else
+        return false;
+}
+
+static unsigned device_count_disconnected_profiles(pa_bluetooth_device *device) {
+    pa_bluetooth_profile_t profile;
+    unsigned count = 0;
+
+    for (profile = 0; profile < PA_BLUETOOTH_PROFILE_COUNT; profile++) {
+        if (!device_supports_profile(device, profile))
+            continue;
+
+        if (!device_is_profile_connected(device, profile))
+            count++;
+    }
+
+    return count;
+}
+
+static void device_stop_waiting_for_profiles(pa_bluetooth_device *device) {
+    if (!device->wait_for_profiles_timer)
+        return;
+
+    device->discovery->core->mainloop->time_free(device->wait_for_profiles_timer);
+    device->wait_for_profiles_timer = NULL;
+}
+
+static void wait_for_profiles_cb(pa_mainloop_api *api, pa_time_event* event, const struct timeval *tv, void *userdata) {
+    pa_bluetooth_device *device = userdata;
+    pa_strbuf *buf;
+    pa_bluetooth_profile_t profile;
+    bool first = true;
+    char *profiles_str;
+
+    device_stop_waiting_for_profiles(device);
+
+    buf = pa_strbuf_new();
+
+    for (profile = 0; profile < PA_BLUETOOTH_PROFILE_COUNT; profile++) {
+        if (device_is_profile_connected(device, profile))
+            continue;
+
+        if (!device_supports_profile(device, profile))
+            continue;
+
+        if (first)
+            first = false;
+        else
+            pa_strbuf_puts(buf, ", ");
+
+        pa_strbuf_puts(buf, pa_bluetooth_profile_to_string(profile));
+    }
+
+    profiles_str = pa_strbuf_to_string_free(buf);
+    pa_log_debug("Timeout expired, and device %s still has disconnected profiles: %s",
+                 device->path, profiles_str);
+    pa_xfree(profiles_str);
+    pa_hook_fire(&device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], device);
+}
+
+static void device_start_waiting_for_profiles(pa_bluetooth_device *device) {
+    pa_assert(!device->wait_for_profiles_timer);
+    device->wait_for_profiles_timer = pa_core_rttime_new(device->discovery->core,
+                                                         pa_rtclock_now() + WAIT_FOR_PROFILES_TIMEOUT_USEC,
+                                                         wait_for_profiles_cb, device);
+}
+
 void pa_bluetooth_transport_set_state(pa_bluetooth_transport *t, pa_bluetooth_transport_state_t state) {
     bool old_any_connected;
+    unsigned n_disconnected_profiles;
+    bool new_device_appeared;
+    bool device_disconnected;
 
     pa_assert(t);
 
@@ -174,15 +270,52 @@ void pa_bluetooth_transport_set_state(pa_bluetooth_transport *t, pa_bluetooth_tr
 
     old_any_connected = pa_bluetooth_device_any_transport_connected(t->device);
 
-    pa_log_debug("Transport %s state changed from %s to %s",
+    pa_log_debug("Transport %s state: %s -> %s",
                  t->path, transport_state_to_string(t->state), transport_state_to_string(state));
 
     t->state = state;
 
     pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_TRANSPORT_STATE_CHANGED], t);
 
-    if (old_any_connected != pa_bluetooth_device_any_transport_connected(t->device))
+    /* If there are profiles that are expected to get connected soon (based
+     * on the UUID list), we wait for a bit before announcing the new
+     * device, so that all profiles have time to get connected before the
+     * card object is created. If we didn't wait, the card would always
+     * have only one profile marked as available in the initial state,
+     * which would prevent module-card-restore from restoring the initial
+     * profile properly. */
+
+    n_disconnected_profiles = device_count_disconnected_profiles(t->device);
+
+    new_device_appeared = !old_any_connected && pa_bluetooth_device_any_transport_connected(t->device);
+    device_disconnected = old_any_connected && !pa_bluetooth_device_any_transport_connected(t->device);
+
+    if (new_device_appeared) {
+        if (n_disconnected_profiles > 0)
+            device_start_waiting_for_profiles(t->device);
+        else
+            pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+        return;
+    }
+
+    if (device_disconnected) {
+        if (t->device->wait_for_profiles_timer) {
+            /* If the timer is still running when the device disconnects, we
+             * never sent the notification of the device getting connected, so
+             * we don't need to send a notification about the disconnection
+             * either. Let's just stop the timer. */
+            device_stop_waiting_for_profiles(t->device);
+        } else
+            pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+        return;
+    }
+
+    if (n_disconnected_profiles == 0 && t->device->wait_for_profiles_timer) {
+        /* All profiles are now connected, so we can stop the wait timer and
+         * send a notification of the new device. */
+        device_stop_waiting_for_profiles(t->device);
         pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+    }
 }
 
 void pa_bluetooth_transport_put(pa_bluetooth_transport *t) {
@@ -416,6 +549,8 @@ static void device_free(pa_bluetooth_device *d) {
 
     pa_assert(d);
 
+    device_stop_waiting_for_profiles(d);
+
     for (i = 0; i < PA_BLUETOOTH_PROFILE_COUNT; i++) {
         pa_bluetooth_transport *t;
 
@@ -618,8 +753,8 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
             dbus_message_iter_recurse(&variant_i, &ai);
 
             if (dbus_message_iter_get_arg_type(&ai) == DBUS_TYPE_STRING && pa_streq(key, "UUIDs")) {
-                /* bluetoothd never removes UUIDs from a device object so there
-                 * is no need to handle it here. */
+                /* bluetoothd never removes UUIDs from a device object so we
+                 * don't need to check for disappeared UUIDs here. */
                 while (dbus_message_iter_get_arg_type(&ai) != DBUS_TYPE_INVALID) {
                     const char *value;
                     char *uuid;
@@ -659,6 +794,7 @@ static void parse_device_properties(pa_bluetooth_device *d, DBusMessageIter *i) 
 
     if (!d->properties_received) {
         d->properties_received = true;
+        device_update_valid(d);
 
         if (!d->address || !d->adapter_path || !d->alias)
             pa_log_error("Non-optional information missing for device %s", d->path);
@@ -750,7 +886,7 @@ static void register_endpoint(pa_bluetooth_discovery *y, const char *path, const
     pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, path, BLUEZ_MEDIA_INTERFACE, "RegisterEndpoint"));
 
     dbus_message_iter_init_append(m, &i);
-    dbus_message_iter_append_basic(&i, DBUS_TYPE_OBJECT_PATH, &endpoint);
+    pa_assert_se(dbus_message_iter_append_basic(&i, DBUS_TYPE_OBJECT_PATH, &endpoint));
     dbus_message_iter_open_container(&i, DBUS_TYPE_ARRAY, DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING DBUS_TYPE_STRING_AS_STRING
                                          DBUS_TYPE_VARIANT_AS_STRING DBUS_DICT_ENTRY_END_CHAR_AS_STRING, &d);
     pa_dbus_append_basic_variant_dict_entry(&d, "UUID", DBUS_TYPE_STRING, &uuid);
@@ -867,12 +1003,25 @@ void pa_bluetooth_discovery_set_ofono_running(pa_bluetooth_discovery *y, bool is
     if (y->headset_backend != HEADSET_BACKEND_AUTO)
         return;
 
-    if (is_running && y->native_backend) {
-        pa_bluetooth_native_backend_free(y->native_backend);
-        y->native_backend = NULL;
+    /* If ofono starts running, all devices that might be connected to the HS role
+     * need to be disconnected, so that the devices can be handled by ofono */
+    if (is_running) {
+        void *state;
+        pa_bluetooth_device *d;
+
+        PA_HASHMAP_FOREACH(d, y->devices, state) {
+            if (device_supports_profile(d, PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)) {
+                DBusMessage *m;
+
+                pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, d->path, "org.bluez.Device1", "Disconnect"));
+                dbus_message_set_no_reply(m, true);
+                dbus_connection_send(pa_dbus_connection_get(y->connection), m, NULL);
+                dbus_message_unref(m);
+            }
+        }
     }
-    else if (!is_running && !y->native_backend)
-        y->native_backend = pa_bluetooth_native_backend_new(y->core, y);
+
+    pa_bluetooth_native_backend_enable_hs_role(y->native_backend, !is_running);
 }
 
 static void get_managed_objects_reply(DBusPendingCall *pending, void *userdata) {
@@ -913,10 +1062,10 @@ static void get_managed_objects_reply(DBusPendingCall *pending, void *userdata) 
 
     y->objects_listed = true;
 
+    if (!y->native_backend && y->headset_backend != HEADSET_BACKEND_OFONO)
+        y->native_backend = pa_bluetooth_native_backend_new(y->core, y, (y->headset_backend == HEADSET_BACKEND_NATIVE));
     if (!y->ofono_backend && y->headset_backend != HEADSET_BACKEND_NATIVE)
         y->ofono_backend = pa_bluetooth_ofono_backend_new(y->core, y);
-    if (!y->ofono_backend && !y->native_backend && y->headset_backend != HEADSET_BACKEND_OFONO)
-        y->native_backend = pa_bluetooth_native_backend_new(y->core, y);
 
 finish:
     dbus_message_unref(r);
@@ -1658,6 +1807,11 @@ void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
 
     pa_dbus_free_pending_list(&y->pending);
 
+    if (y->ofono_backend)
+        pa_bluetooth_ofono_backend_free(y->ofono_backend);
+    if (y->native_backend)
+        pa_bluetooth_native_backend_free(y->native_backend);
+
     if (y->adapters)
         pa_hashmap_free(y->adapters);
 
@@ -1668,11 +1822,6 @@ void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
         pa_assert(pa_hashmap_isempty(y->transports));
         pa_hashmap_free(y->transports);
     }
-
-    if (y->ofono_backend)
-        pa_bluetooth_ofono_backend_free(y->ofono_backend);
-    if (y->native_backend)
-        pa_bluetooth_native_backend_free(y->native_backend);
 
     if (y->connection) {
 
